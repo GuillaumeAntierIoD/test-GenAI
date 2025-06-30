@@ -1,0 +1,3 @@
+def harmonize_with_sd(image: np.ndarray):
+    # Utilise Stable Diffusion pour améliorer le rendu visuel
+    ...

@@ -1,0 +1,9 @@
+streamlit
+torch
+torchvision
+opencv-python
+matplotlib
+numpy
+Pillow
+segment_anything @ git+https://github.com/facebookresearch/segment-anything.git
+timm
