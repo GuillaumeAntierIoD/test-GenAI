@@ -8,6 +8,7 @@ import sys
 import os
 import matplotlib.cm as cm
 from rembg import remove
+import time
 
 MODELS_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), 'models'))
 os.environ['TORCH_HOME'] = MODELS_PATH
@@ -60,11 +61,16 @@ if env_file:
     env_pil = Image.open(env_file)
     if 'analysis_done' not in st.session_state or st.session_state.env_file_name != env_file.name:
         with st.spinner("Analyse de la pièce en cours... 🧠"):
+            start_time_analysis = time.perf_counter()
             st.session_state.image_np, st.session_state.masks = segment_image(env_pil, sam_mask_generator)
             st.session_state.depth_map = estimate_depth(env_pil, midas_components[0], midas_components[1])
             st.session_state.env_caption = generate_caption(env_pil, captioning_components[0], captioning_components[1])
+            end_time_analysis = time.perf_counter()
+            st.session_state.analysis_duration = end_time_analysis - start_time_analysis
             st.session_state.analysis_done = True
             st.session_state.env_file_name = env_file.name
+    
+    st.success(f"Analyse de la scène terminée en {st.session_state.analysis_duration:.2f} secondes.")
     
     if obj_file:
         if 'obj_file_name' not in st.session_state or st.session_state.obj_file_name != obj_file.name:
@@ -106,17 +112,37 @@ if env_file:
 
         if 'composite_image' in st.session_state:
             st.subheader("Étape 2 : Harmonisation Photoréaliste (IA)")
-            auto_prompt = f"{st.session_state.obj_caption} in {st.session_state.env_caption}, photorealistic, realistic shadows, 8k, high quality"
+
+            col_opts1, col_opts2 = st.columns(2)
+            with col_opts1:
+                sd_steps = st.slider("Qualité vs Vitesse (Étapes)", min_value=10, max_value=50, value=20, step=1)
+            with col_opts2:
+                sd_strength = st.slider("Force de l'harmonisation", min_value=0.5, max_value=1.0, value=0.85, step=0.05)
+
+            auto_prompt = f"{st.session_state.get('obj_caption', 'an object')} in {st.session_state.get('env_caption', 'a room')}, photorealistic, realistic shadows, 8k, high quality"
             prompt_text = st.text_area("Prompt généré automatiquement (vous pouvez le modifier) :", auto_prompt, height=100)
+
             if st.button("🚀 Lancer l'harmonisation", use_container_width=True, type="primary"):
                 if sd_pipeline is None:
                     st.error("Le modèle d'harmonisation (Stable Diffusion) n'a pas pu être chargé.")
                 else:
-                    with st.spinner("L'IA redessine l'image... C'est l'étape la plus longue, un peu de patience !"):
+                    with st.spinner(f"L'IA redessine l'image en {sd_steps} étapes... Un peu de patience !"):
+                        start_time_harmonization = time.perf_counter()
                         inpainting_mask = create_inpainting_mask(st.session_state.object_mask)
-                        final_image = harmonize_image(st.session_state.composite_image, inpainting_mask, prompt_text, sd_pipeline)
+
+                        final_image = harmonize_image(
+                            st.session_state.composite_image,
+                            inpainting_mask,
+                            prompt_text,
+                            sd_pipeline,
+                            strength=sd_strength,
+                            num_inference_steps=sd_steps
+                        )
+                        end_time_harmonization = time.perf_counter()
+                        st.session_state.harmonization_duration = end_time_harmonization - start_time_harmonization
                         if final_image:
                             st.session_state.final_image = final_image
 
             if 'final_image' in st.session_state:
-                st.image(st.session_state.final_image, caption="✨ Résultat Final Harmonisé ✨", use_container_width=True)
+                duration_text = f"Généré en {st.session_state.harmonization_duration:.2f}s"
+                st.image(st.session_state.final_image, caption=f"✨ Résultat Final Harmonisé ({duration_text}) ✨", use_container_width=True)

@@ -1,5 +1,5 @@
 import torch
-from diffusers import AutoPipelineForInpainting
+from diffusers import AutoPipelineForInpainting, EulerDiscreteScheduler
 from PIL import Image
 import numpy as np
 import cv2
@@ -36,13 +36,17 @@ def generate_caption(image_pil, processor, model):
     return generated_caption
 
 def load_sd_inpainting_model():
+    """Charge le pipeline Stable Diffusion avec un ordonnanceur optimisé."""
     print(f"Chargement du modèle Stable Diffusion Inpainting sur le périphérique : {DEVICE}...")
     try:
-        pipeline = AutoPipelineForInpainting.from_pretrained(
-            "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
-            torch_dtype=DTYPE,
-            variant="fp16"
-        ).to(DEVICE)
+        model_id = "runwayml/stable-diffusion-inpainting"
+        pipeline = AutoPipelineForInpainting.from_pretrained(model_id, torch_dtype=DTYPE)
+
+        pipeline.scheduler = EulerDiscreteScheduler.from_config(pipeline.scheduler.config)
+
+        pipeline = pipeline.to(DEVICE)
+        if DEVICE == "cuda":
+            pipeline.enable_sequential_cpu_offload()
         print("Modèle Stable Diffusion chargé avec succès.")
         return pipeline
     except Exception as e:
@@ -56,9 +60,9 @@ def create_inpainting_mask(object_mask, expansion_pixels=50):
     dilated_mask = cv2.dilate(mask_uint8, kernel, iterations=1)
     return Image.fromarray(dilated_mask)
 
-def harmonize_image(composite_image_pil, inpainting_mask_pil, prompt, sd_pipeline, strength=0.85):
+def harmonize_image(composite_image_pil, inpainting_mask_pil, prompt, sd_pipeline, strength=0.85, num_inference_steps=20):
     if sd_pipeline is None: return None
-    print("Début de l'harmonisation avec Stable Diffusion...")
+    print(f"Début de l'harmonisation ({num_inference_steps} étapes)...")
     try:
         negative_prompt = "low quality, blurry, unrealistic, watermark, signature, text, ugly, deformed"
         harmonized_image = sd_pipeline(
@@ -67,7 +71,7 @@ def harmonize_image(composite_image_pil, inpainting_mask_pil, prompt, sd_pipelin
             image=composite_image_pil.convert("RGB"),
             mask_image=inpainting_mask_pil.convert("RGB"),
             strength=strength,
-            num_inference_steps=25,
+            num_inference_steps=num_inference_steps, 
         ).images[0]
         print("Harmonisation terminée avec succès.")
         return harmonized_image
