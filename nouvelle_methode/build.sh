@@ -1,5 +1,5 @@
 set -o errexit
 
-pip install -r requirements.txt
+pip install -r requirement.txt
 
 mkdir -p models
