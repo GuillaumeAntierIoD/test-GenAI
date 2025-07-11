@@ -1,0 +1,21 @@
+# Fichier requirements.txt simplifié
+
+# Framework de l'application
+streamlit
+streamlit-drawable-canvas
+
+# Traitement d'image de base
+Pillow
+opencv-contrib-python
+rembg[gpu] # On spécifie [gpu] pour de meilleures perfs sur Render
+
+# Coeur de l'IA (PyTorch et Hugging Face)
+torch
+torchvision
+diffusers
+transformers
+accelerate
+safetensors
+
+# Modèles spécifiques
+scipy # Utilisé par PyMatting, une dépendance de rembg

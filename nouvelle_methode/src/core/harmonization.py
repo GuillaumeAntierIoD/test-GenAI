@@ -78,8 +78,7 @@ def generate_adaptive_prompt(obj_caption, env_caption):
     }
     
     # Construction du prompt court (viser ~60 tokens)
-    prompt = f"{obj_caption} in {env_caption}. Perfect integration. {material_prompts[detected_material]}. {surface_prompts[detected_surface]}. Professional photography quality."
-    
+    prompt = f"{obj_caption} in {env_caption}. Perfect integration. {material_prompts[detected_material]}. {surface_prompts[detected_surface]}. Grounded with soft, physically accurate contact shadows. Professional photography quality."    
     return prompt
 
 def generate_caption(image_pil, processor, model):
@@ -138,7 +137,7 @@ def create_inpainting_mask(object_mask):
     kernel = np.ones((15, 15), np.uint8) 
     dilated_mask = cv2.dilate(mask_uint8, kernel, iterations=1)
 
-    blurred_mask = cv2.GaussianBlur(dilated_mask, (31, 31), 0) 
+    blurred_mask = cv2.GaussianBlur(dilated_mask, (61, 61), 0) 
 
     final_mask = Image.fromarray(blurred_mask)
     
@@ -148,17 +147,19 @@ def harmonize_image(composite_image_pil,
                     inpainting_mask_pil, 
                     prompt, 
                     sd_pipeline, 
-                    strength=0.35, 
+                    strength, 
                     num_inference_steps=7, 
                     progress_callback: Optional[Callable] = None):
     
     if sd_pipeline is None: return None
     print(f"Début de l'harmonisation ({num_inference_steps} étapes)...")
     try:
+        original_size = composite_image_pil.size 
+
         negative_prompt = "low quality, blurry, unrealistic, watermark, signature, text, ugly, deformed"
         
         with torch.inference_mode():
-            harmonized_image = sd_pipeline(
+            output_image_small = sd_pipeline(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
                 image=composite_image_pil.convert("RGB"),
@@ -168,11 +169,19 @@ def harmonize_image(composite_image_pil,
                 callback_on_step_end=progress_callback
             ).images[0]
         
+        if output_image_small.size != original_size:
+            print(f"Redimensionnement de l'image de sortie de {output_image_small.size} à {original_size}")
+            harmonized_image = output_image_small.resize(original_size, Image.Resampling.LANCZOS)
+        else:
+            harmonized_image = output_image_small
+
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         print("Harmonisation terminée avec succès.")
-        return harmonized_image
+        return harmonized_image 
+    
     except Exception as e:
         print(f"Une erreur est survenue lors de l'harmonisation : {e}")
         return None

@@ -16,7 +16,12 @@ from core.harmonization import load_sd_inpainting_model, create_inpainting_mask,
 
 # --- Interface Streamlit ---
 st.set_page_config(layout="wide", page_title="Projet de Staging Virtuel")
-st.title("🛋️ Projet de Staging Virtuel par Perspective")
+col1, col2 = st.columns([1, 5]) 
+with col1:
+    st.image("IoD_solutions_logo_500px-3.png")
+
+with col2:
+    st.title("Démonstrateur Staging Virtuel")
 
 # --- Initialisation des modèles (à la demande) ---
 if 'models' not in st.session_state:
@@ -36,6 +41,9 @@ obj_file = st.sidebar.file_uploader("2. Image de l'objet", type=["png", "jpg"])
 # --- Logique principale (simplifiée) ---
 if not env_file:
     st.info("Bienvenue ! Veuillez uploader une image d'environnement pour commencer.")
+
+if not obj_file:
+    st.info("Veuillez uploader une image de portail pour commencer.")
 else:
     env_pil = Image.open(env_file)
     if st.session_state.get('env_file_name') != env_file.name:
@@ -143,6 +151,7 @@ else:
                     st.session_state.get('obj_caption', 'gate'), 
                     st.session_state.get('env_caption', 'outdoor entrance')
                 )    
+                print(auto_prompt)
                 if 'captioning' in st.session_state.models:
                         del st.session_state.models['captioning']
                 if torch.cuda.is_available():
@@ -151,7 +160,7 @@ else:
                 progress_text = st.sidebar.empty()
 
                 base_inference_steps = 10 
-                strength_value = 0.4
+                strength_value = 0.45
                 actual_steps_to_run = int(base_inference_steps * strength_value) 
 
                 def update_progress(pipe, step, timestep, kwargs):
