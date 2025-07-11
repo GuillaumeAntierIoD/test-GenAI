@@ -2,3 +2,4 @@ AncienneMethode/models
 AncienneMethode/src/MiDaS
 .env
 nouvelle_methode/models
+nouvelle_methode/.venv/

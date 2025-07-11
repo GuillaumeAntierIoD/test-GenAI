@@ -1,148 +1,225 @@
-# Fichier : app.py
-
 import streamlit as st
 from PIL import Image
 import numpy as np
-import matplotlib.pyplot as plt
 import sys
 import os
-import matplotlib.cm as cm
+import torch
 from rembg import remove
+from streamlit_drawable_canvas import st_canvas
 import time
+import cv2
 
-MODELS_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), 'models'))
-os.environ['TORCH_HOME'] = MODELS_PATH
+# --- Configuration des chemins et imports (nettoyés) ---
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'src')))
+from core.placement import insert_object_with_perspective
+from core.harmonization import load_sd_inpainting_model, create_inpainting_mask, harmonize_image, load_captioning_model, generate_caption, generate_adaptive_prompt
 
-from core.segmentation import load_sam_model, segment_image
-from core.depth_estimation import load_midas_model, estimate_depth
-from core.placement import find_floor_mask, get_placement_point, calculate_scale_from_depth, insert_object
-from core.harmonization import load_sd_inpainting_model, create_inpainting_mask, harmonize_image, load_captioning_model, generate_caption
-
-def show_masks_on_image(image_np, masks):
-    if not masks:
-        fig, ax = plt.subplots(); ax.imshow(image_np); ax.axis("off"); return fig
-    sorted_masks = sorted(masks, key=(lambda x: x['area']), reverse=True)
-    fig, ax = plt.subplots(figsize=(10, 10))
-    ax.imshow(image_np)
-    for mask in sorted_masks:
-        m = mask['segmentation']
-        color = np.concatenate([np.random.random(3), [0.55]])
-        ax.imshow(np.dstack((m, m, m, m)) * color)
-    ax.axis("off"); plt.tight_layout(); return fig
-
-def normalize_depth_map(depth_map):
-    return (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min())
-
+# --- Interface Streamlit ---
 st.set_page_config(layout="wide", page_title="Projet de Staging Virtuel")
-st.title("🛋️ Projet de Staging Virtuel IA")
-st.markdown("Uploadez une image de pièce, puis une image d'objet pour l'intégrer, et enfin, rendez le tout photoréaliste.")
-st.divider()
+st.title("🛋️ Projet de Staging Virtuel par Perspective")
 
-@st.cache_resource
-def get_models():
-    """Charge tous les modèles nécessaires (SAM, MiDaS, SD et BLIP)."""
-    sam_generator = load_sam_model()
-    midas_model, midas_transform = load_midas_model()
-    sd_pipeline = load_sd_inpainting_model()
-    caption_processor, caption_model = load_captioning_model()
-    return sam_generator, (midas_model, midas_transform), sd_pipeline, (caption_processor, caption_model)
+# --- Initialisation des modèles (à la demande) ---
+if 'models' not in st.session_state:
+    st.session_state.models = {}
+def get_model(model_name, load_function):
+    """Charge un modèle et le met en cache dans la session Streamlit."""
+    if model_name not in st.session_state.models:
+        with st.spinner(f"Chargement du modèle {model_name}..."):
+            st.session_state.models[model_name] = load_function()
+    return st.session_state.models[model_name]
 
-with st.spinner("Veuillez patienter, chargement des modèles d'IA (cela peut prendre du temps la première fois)..."):
-    sam_mask_generator, midas_components, sd_pipeline, captioning_components = get_models()
+# --- UI (Barre latérale) ---
+st.sidebar.header("Commandes")
+env_file = st.sidebar.file_uploader("1. Image de l'environnement", type=["jpg", "png"])
+obj_file = st.sidebar.file_uploader("2. Image de l'objet", type=["png", "jpg"])
 
-col1_upload, col2_upload = st.columns(2)
-with col1_upload:
-    env_file = st.file_uploader("1. Choisissez une image de pièce...", type=["jpg", "png"])
-with col2_upload:
-    obj_file = st.file_uploader("2. Choisissez un objet...", type=["png", "jpg"])
-
-if env_file:
+# --- Logique principale (simplifiée) ---
+if not env_file:
+    st.info("Bienvenue ! Veuillez uploader une image d'environnement pour commencer.")
+else:
     env_pil = Image.open(env_file)
-    if 'analysis_done' not in st.session_state or st.session_state.env_file_name != env_file.name:
-        with st.spinner("Analyse de la pièce en cours... 🧠"):
-            start_time_analysis = time.perf_counter()
-            st.session_state.image_np, st.session_state.masks = segment_image(env_pil, sam_mask_generator)
-            st.session_state.depth_map = estimate_depth(env_pil, midas_components[0], midas_components[1])
-            st.session_state.env_caption = generate_caption(env_pil, captioning_components[0], captioning_components[1])
-            end_time_analysis = time.perf_counter()
-            st.session_state.analysis_duration = end_time_analysis - start_time_analysis
-            st.session_state.analysis_done = True
-            st.session_state.env_file_name = env_file.name
+    if st.session_state.get('env_file_name') != env_file.name:
+        keys_to_clear = ['obj_file_name', 'obj_pil', 'obj_no_bg', 'composite_image', 'final_image', 'object_mask', 'perspective_points']
+        for key in keys_to_clear:
+            if key in st.session_state:
+                del st.session_state[key]
+        st.session_state.env_file_name = env_file.name
     
-    st.success(f"Analyse de la scène terminée en {st.session_state.analysis_duration:.2f} secondes.")
+    if 'canvas_key_counter' not in st.session_state:
+        st.session_state.canvas_key_counter = 0
+
+    if obj_file:
+        st.sidebar.divider()
+        st.sidebar.subheader("Objet à placer")
+        if st.session_state.get('obj_file_name') != obj_file.name:
+            st.session_state.obj_file_name = obj_file.name
+            original_obj_pil = Image.open(obj_file)
+            with st.spinner("Suppression du fond et rognage..."):
+                img_no_bg = remove(original_obj_pil)
+                bbox = img_no_bg.getbbox()
+                if bbox:
+                    st.session_state.obj_no_bg = img_no_bg.crop(bbox)
+                else:
+                    st.session_state.obj_no_bg = img_no_bg
+        
+            for key in ['composite_image', 'perspective_points']:
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.rerun()
+        
+        obj_to_display = st.session_state.get('obj_no_bg')
+        if obj_to_display: st.sidebar.image(obj_to_display)
     
     if obj_file:
-        if 'obj_file_name' not in st.session_state or st.session_state.obj_file_name != obj_file.name:
-            st.session_state.obj_pil = Image.open(obj_file)
-            st.session_state.obj_file_name = obj_file.name
-            # CORRIGÉ : On utilise st.session_state.obj_pil qui existe, et non la variable locale "obj_pil"
-            st.session_state.obj_caption = generate_caption(st.session_state.obj_pil, captioning_components[0], captioning_components[1])
-            if 'obj_no_bg' in st.session_state: del st.session_state['obj_no_bg']
-            if 'composite_image' in st.session_state: del st.session_state['composite_image']
-            if 'final_image' in st.session_state: del st.session_state['final_image']
-
-        st.subheader("Étape 1 : Préparation et Placement")
-        col_param, col_result = st.columns([1, 2])
+        st.subheader("Définissez la perspective avec 4 points")
+        st.markdown("""
+        **Instructions :** Cliquez sur 4 points pour définir les coins de votre objet.
+        *Respectez cet ordre pour un placement correct :*
+        1. 🔴 **Haut-gauche**
+        2. 🟡 **Haut-droit**
+        3. 🟢 **Bas-droit**
+        4. 🔵 **Bas-gauche**
+        """)
         
-        with col_param:
-            image_to_display = st.session_state.get('obj_no_bg', st.session_state.obj_pil)
-            st.image(image_to_display, caption="Objet à placer", width=200)
-            if st.button("✨ Supprimer le fond"):
-                with st.spinner("Suppression du fond..."):
-                    st.session_state.obj_no_bg = remove(st.session_state.obj_pil)
-                st.rerun()
-            base_scale_slider = st.slider("Ajuster la taille de base", 0.1, 2.0, 0.5, 0.05)
-            if st.button("Placer dans la scène", use_container_width=True, type="primary"):
-                with st.spinner("Intégration en cours..."):
-                    floor = find_floor_mask(st.session_state.masks, st.session_state.image_np.shape[0])
-                    if floor is not None:
-                        point = get_placement_point(floor)
-                        if point is not None:
-                            scale = calculate_scale_from_depth(st.session_state.depth_map, point, base_scale=base_scale_slider)
-                            st.session_state.composite_image, st.session_state.object_mask = insert_object(env_pil, image_to_display, point, scale, return_mask=True)
+        background_image_to_show = st.session_state.get('composite_image', env_pil)
+
+        canvas_result = st_canvas(
+            background_image=background_image_to_show,
+            height=env_pil.height,
+            width=env_pil.width,
+            drawing_mode="point",
+            point_display_radius=8,
+            update_streamlit=True,
+            key=f"canvas_{st.session_state.canvas_key_counter}",
+        )
         
-        with col_result:
-            if 'composite_image' in st.session_state:
-                st.image(st.session_state.composite_image, caption="Résultat du collage", use_container_width=True)
-            else:
-                st.info("Ajustez les paramètres et cliquez sur 'Placer dans la scène'.")
+        if canvas_result.json_data and canvas_result.json_data.get("objects"):
+            points = canvas_result.json_data["objects"]
+            
+            point_count = len(points)
+            if point_count == 1: st.info("🔴 Point 1 placé. Cliquez pour le point 2 (coin haut-droit)")
+            elif point_count == 2: st.info("🟡 Point 2 placé. Cliquez pour le point 3 (coin bas-droit)")
+            elif point_count == 3: st.info("🟢 Point 3 placé. Cliquez pour le point 4 (coin bas-gauche)")
 
-        st.divider()
+            if len(points) >= 4:
+                last_4_points = points[-4:]
+                current_quad = [(int(p["left"]), int(p["top"])) for p in last_4_points]
+                
+                if (current_quad != st.session_state.get("perspective_points")):
+                    st.session_state.perspective_points = current_quad
+                    obj_to_place = st.session_state.get('obj_no_bg')
+                    if obj_to_place:
+                        composite_image, object_mask = insert_object_with_perspective(
+                            env_pil, obj_to_place, current_quad, return_mask=True)
+                        st.session_state.composite_image = composite_image
+                        st.session_state.object_mask = object_mask
+                    st.rerun()
+                
+                st.success("✅ 4 points placés ! L'objet est positionné.")
+                if st.button("🔄 Recommencer le placement"):
+                    st.session_state.perspective_points = []
+                    if 'composite_image' in st.session_state: del st.session_state['composite_image']
+                    if 'object_mask' in st.session_state: del st.session_state['object_mask']
+                    st.session_state.canvas_key_counter += 1
+                    st.rerun()
 
+        # --- Étape 3 : Harmonisation (si un collage existe) ---
         if 'composite_image' in st.session_state:
-            st.subheader("Étape 2 : Harmonisation Photoréaliste (IA)")
+            st.sidebar.divider()
+            st.sidebar.subheader("Étape 3 : Harmonisation (IA)")
+                
+            if st.sidebar.button("🚀 Lancer l'harmonisation", use_container_width=True):
+        
+                st.sidebar.markdown("Début de l'harmonisation...")
+                if 'env_caption' not in st.session_state:
+                    captioning_components = get_model('captioning', load_captioning_model)
+                    st.session_state.env_caption = generate_caption(env_pil, captioning_components[0], captioning_components[1])
+                if 'obj_caption' not in st.session_state:
+                    captioning_components = get_model('captioning', load_captioning_model)
+                    obj_to_place = st.session_state.get('obj_no_bg', st.session_state.get('obj_pil'))
+                    st.session_state.obj_caption = generate_caption(obj_to_place, captioning_components[0], captioning_components[1])
 
-            col_opts1, col_opts2 = st.columns(2)
-            with col_opts1:
-                sd_steps = st.slider("Qualité vs Vitesse (Étapes)", min_value=10, max_value=50, value=20, step=1)
-            with col_opts2:
-                sd_strength = st.slider("Force de l'harmonisation", min_value=0.5, max_value=1.0, value=0.85, step=0.05)
+                auto_prompt = generate_adaptive_prompt(
+                    st.session_state.get('obj_caption', 'gate'), 
+                    st.session_state.get('env_caption', 'outdoor entrance')
+                )    
+                if 'captioning' in st.session_state.models:
+                        del st.session_state.models['captioning']
+                if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                progress_bar = st.sidebar.progress(0)
+                progress_text = st.sidebar.empty()
 
-            auto_prompt = f"{st.session_state.get('obj_caption', 'an object')} in {st.session_state.get('env_caption', 'a room')}, photorealistic, realistic shadows, 8k, high quality"
-            prompt_text = st.text_area("Prompt généré automatiquement (vous pouvez le modifier) :", auto_prompt, height=100)
+                base_inference_steps = 10 
+                strength_value = 0.4
+                actual_steps_to_run = int(base_inference_steps * strength_value) 
 
-            if st.button("🚀 Lancer l'harmonisation", use_container_width=True, type="primary"):
-                if sd_pipeline is None:
-                    st.error("Le modèle d'harmonisation (Stable Diffusion) n'a pas pu être chargé.")
-                else:
-                    with st.spinner(f"L'IA redessine l'image en {sd_steps} étapes... Un peu de patience !"):
-                        start_time_harmonization = time.perf_counter()
-                        inpainting_mask = create_inpainting_mask(st.session_state.object_mask)
+                def update_progress(pipe, step, timestep, kwargs):
+                    percentage = int(((step + 1) / actual_steps_to_run) * 100)
+                    progress_bar.progress(percentage)
+                    progress_text.text(f"Étape {step + 1}/{actual_steps_to_run} en cours...")
+                    return kwargs
 
-                        final_image = harmonize_image(
-                            st.session_state.composite_image,
-                            inpainting_mask,
-                            prompt_text,
-                            sd_pipeline,
-                            strength=sd_strength,
-                            num_inference_steps=sd_steps
-                        )
-                        end_time_harmonization = time.perf_counter()
-                        st.session_state.harmonization_duration = end_time_harmonization - start_time_harmonization
-                        if final_image:
-                            st.session_state.final_image = final_image
+                with st.spinner("Chargement des modèles et préparation..."):
+                    sd_pipeline = get_model('sd_pipeline', load_sd_inpainting_model)
+                    
+                    inpainting_mask = create_inpainting_mask(st.session_state.object_mask)
 
-            if 'final_image' in st.session_state:
-                duration_text = f"Généré en {st.session_state.harmonization_duration:.2f}s"
-                st.image(st.session_state.final_image, caption=f"✨ Résultat Final Harmonisé ({duration_text}) ✨", use_container_width=True)
+                final_image = harmonize_image(
+                    st.session_state.composite_image, 
+                    inpainting_mask, 
+                    auto_prompt, 
+                    sd_pipeline, 
+                    strength=strength_value,
+                    num_inference_steps=base_inference_steps,
+                    progress_callback=update_progress 
+                )
+                
+                progress_bar.progress(100)
+                progress_text.success("Harmonisation terminée avec succès !") 
+                
+                st.session_state.final_image = final_image
+
+                if 'sd_pipeline' in st.session_state.models:
+                    del st.session_state.models['sd_pipeline']
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                import time
+                time.sleep(2) 
+
+                st.rerun()
+
+        if 'final_image' in st.session_state and 'composite_image' in st.session_state:
+            st.subheader("Comparaison Avant/Après")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**Avant harmonisation**")
+                st.image(st.session_state.composite_image)
+            
+            with col2:
+                st.markdown("**Après harmonisation**")
+                st.image(st.session_state.final_image)
+            
+            # Bouton pour télécharger le résultat
+            if st.button("💾 Télécharger le résultat"):
+                # Convertir en bytes pour le téléchargement
+                import io
+                buf = io.BytesIO()
+                st.session_state.final_image.save(buf, format="PNG")
+                st.download_button(
+                    label="Télécharger l'image finale",
+                    data=buf.getvalue(),
+                    file_name="staging_virtuel_resultat.png",
+                    mime="image/png"
+                )
+    
+    elif not obj_file and st.session_state.get('analysis_done'):
+        st.image(env_pil)
+        st.info("Veuillez uploader une image d'objet dans la barre de gauche pour continuer.")
+
+    elif env_file and not st.session_state.get('analysis_done'):
+        st.image(env_pil)
+        st.info("Cliquez sur 'Analyser la scène' dans la barre de gauche pour commencer.")
