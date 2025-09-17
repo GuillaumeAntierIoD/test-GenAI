@@ -2,7 +2,12 @@ import torch
 from diffusers import AutoPipelineForInpainting, EulerDiscreteScheduler
 from PIL import Image
 import numpy as np
+import google.generativeai as genai
+from google.api_core import exceptions
+import io
+import os
 import cv2
+import streamlit as st
 from transformers import BlipProcessor, BlipForConditionalGeneration
 from typing import Callable, Optional
 
@@ -24,61 +29,16 @@ def load_captioning_model():
         return None, None
     
 
-def generate_adaptive_prompt(obj_caption, env_caption):
+def generate_adaptive_prompt(obj_caption: str, env_caption: str) -> str:
     """
-    Génère un prompt adaptatif optimisé pour CLIP (77 tokens max)
+    Génère un prompt descriptif pour l'API Gemini.
     """
-    
-    # Détection du matériau (version simplifiée)
-    material_keywords = {
-        'metal': ['metal', 'iron', 'steel', 'aluminum', 'wrought'],
-        'wood': ['wood', 'wooden', 'timber'],
-        'stone': ['stone', 'concrete', 'brick'],
-        'glass': ['glass', 'transparent']
-    }
-    
-    # Détection du sol (version simplifiée)
-    surface_keywords = {
-        'paved': ['pavement', 'paved', 'stone', 'brick', 'tile'],
-        'concrete': ['concrete', 'cement'],
-        'gravel': ['gravel', 'pebble'],
-        'grass': ['grass', 'lawn', 'garden']
-    }
-    
-    # Détection matériau
-    detected_material = 'generic'
-    for material, keywords in material_keywords.items():
-        if any(keyword in obj_caption.lower() for keyword in keywords):
-            detected_material = material
-            break
-    
-    # Détection surface
-    detected_surface = 'ground'
-    for surface, keywords in surface_keywords.items():
-        if any(keyword in env_caption.lower() for keyword in keywords):
-            detected_surface = surface
-            break
-    
-    # Prompts courts et efficaces par matériau
-    material_prompts = {
-        'metal': 'weathered metal with realistic reflections and shadows',
-        'wood': 'natural wood with grain texture and weathering',
-        'stone': 'stone texture with natural weathering',
-        'glass': 'clear glass with realistic reflections',
-        'generic': 'natural surface with realistic shadows'
-    }
-    
-    # Prompts de surface courts
-    surface_prompts = {
-        'paved': 'natural wear on pavement',
-        'concrete': 'subtle concrete staining',
-        'gravel': 'natural gravel displacement',
-        'grass': 'grass wear patterns',
-        'ground': 'natural ground wear'
-    }
-    
-    # Construction du prompt court (viser ~60 tokens)
-    prompt = f"{obj_caption} in {env_caption}. Perfect integration. {material_prompts[detected_material]}. {surface_prompts[detected_surface]}. Grounded with soft, physically accurate contact shadows. Professional photography quality."    
+    prompt = (
+        f"En utilisant l'image fournie qui montre un '{obj_caption}' placé dans un '{env_caption}', "
+        f"modifie l'image pour que le '{obj_caption}' s'intègre parfaitement. "
+        "Ajuste son éclairage, ses ombres, sa balance des couleurs et sa texture pour qu'ils correspondent au style et à l'ambiance de la pièce. "
+        "Le résultat doit être photoréaliste, comme si l'objet avait toujours été là. Ne modifie rien d'autre dans la pièce."
+    )
     return prompt
 
 def generate_caption(image_pil, processor, model):
@@ -94,94 +54,38 @@ def generate_caption(image_pil, processor, model):
     
     return generated_caption
 
-def load_sd_inpainting_model():
-    """Charge le pipeline Stable Diffusion avec des optimisations mémoire."""
-    print(f"Chargement du modèle Stable Diffusion Inpainting sur le périphérique : {DEVICE}...")
-    try:
-        model_id = "runwayml/stable-diffusion-inpainting"
-        pipeline = AutoPipelineForInpainting.from_pretrained(model_id, torch_dtype=DTYPE)
-
-        pipeline.scheduler = EulerDiscreteScheduler.from_config(pipeline.scheduler.config)
-        pipeline = pipeline.to(DEVICE)
-
-        if DEVICE == "cuda":
-            pipeline.enable_attention_slicing()
-            pipeline.enable_sequential_cpu_offload()
-
-        print("Modèle Stable Diffusion chargé avec succès.")
-        return pipeline
-    except Exception as e:
-        print(f"Erreur lors du chargement du modèle Stable Diffusion : {e}")
-        return None
-
-def create_inpainting_mask(object_mask):
+def harmonize_image_with_gemini(composite_image: Image.Image, prompt: str, api_key: str):
     """
-    Crée un masque d'inpainting en dilatant et floutant le masque de l'objet.
-    Accepte une image PIL ou un array NumPy en entrée.
+    Appelle l'API Gemini (Gemini 2.5 Flash Image) pour réaliser l'harmonisation.
     """
-
-    if isinstance(object_mask, Image.Image):
-        mask_np = np.array(object_mask)
-    else:
-        mask_np = object_mask
-
-    if mask_np.ndim == 3:
-        if mask_np.shape[2] == 4: 
-            mask_np = mask_np[:, :, 3] 
-        else: 
-            mask_np = mask_np[:, :, 0] 
-
-    
-    mask_uint8 = mask_np.astype(np.uint8) if mask_np.dtype != np.uint8 else mask_np
-
-    kernel = np.ones((15, 15), np.uint8) 
-    dilated_mask = cv2.dilate(mask_uint8, kernel, iterations=1)
-
-    blurred_mask = cv2.GaussianBlur(dilated_mask, (61, 61), 0) 
-
-    final_mask = Image.fromarray(blurred_mask)
-    
-    return final_mask
-
-def harmonize_image(composite_image_pil, 
-                    inpainting_mask_pil, 
-                    prompt, 
-                    sd_pipeline, 
-                    strength, 
-                    num_inference_steps=7, 
-                    progress_callback: Optional[Callable] = None):
-    
-    if sd_pipeline is None: return None
-    print(f"Début de l'harmonisation ({num_inference_steps} étapes)...")
     try:
-        original_size = composite_image_pil.size 
+        genai.configure(api_key=api_key)
 
-        negative_prompt = "low quality, blurry, unrealistic, watermark, signature, text, ugly, deformed"
-        
-        with torch.inference_mode():
-            output_image_small = sd_pipeline(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                image=composite_image_pil.convert("RGB"),
-                mask_image=inpainting_mask_pil.convert("RGB"),
-                strength=strength,
-                num_inference_steps=num_inference_steps,
-                callback_on_step_end=progress_callback
-            ).images[0]
-        
-        if output_image_small.size != original_size:
-            print(f"Redimensionnement de l'image de sortie de {output_image_small.size} à {original_size}")
-            harmonized_image = output_image_small.resize(original_size, Image.Resampling.LANCZOS)
+        model = genai.GenerativeModel('gemini-2.5-flash-image-preview')
+
+        response = model.generate_content([prompt, composite_image])
+
+        print(response)
+
+        if not response.candidates:
+            print("Erreur : La réponse de l'API ne contient aucun candidat.")
+            return None
+
+        image_part = response.candidates[0].content.parts[0]
+        if image_part.inline_data:
+            image_data = image_part.inline_data.data
+            final_image = Image.open(io.BytesIO(image_data))
+            return final_image
         else:
-            harmonized_image = output_image_small
+            print("Erreur : L'API n'a pas retourné de données d'image.")
+            return None
 
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        print("Harmonisation terminée avec succès.")
-        return harmonized_image 
+    except exceptions.ResourceExhausted as e:
+        print(f"Quota dépassé : {e}")
+        st.error("Le service d'harmonisation est surchargé. Vous avez dépassé le quota de requêtes. Veuillez réessayer dans une minute.")
+        return None
     
     except Exception as e:
-        print(f"Une erreur est survenue lors de l'harmonisation : {e}")
+        print(f"Une erreur inattendue est survenue lors de l'appel à l'API Gemini : {e}")
+        st.error("Une erreur inattendue est survenue avec le service d'harmonisation.")
         return None
